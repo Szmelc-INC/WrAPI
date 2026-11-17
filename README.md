@@ -1,98 +1,134 @@
 # WRAPI — Wrapper API for Google AI Mode
 
-Localhost HTTP API that queries **Google AI Mode** (`udm=50`) through a real
-Chromium driven by Playwright, and returns the AI answer + sources as JSON.
-Any local script or program can use it — no Google API keys involved.
+Localhost API that queries **Google AI Mode** (`udm=50`) through a real
+Chromium driven by Playwright and speaks both a native JSON API and the
+**OpenAI `/v1/chat/completions` format** (SSE streaming included) — so any
+harness, TUI or script that talks to OpenAI-style endpoints can use it as an
+extra "local model".
 
 ```
-prompt → WRAPI (127.0.0.1:8787) → Playwright → google.com/search?q=…&udm=50&csuir=1 → JSON
+prompt → WRAPI (127.0.0.1:8787) → Playwright → google.com/search?q=…&udm=50&csuir=1 → JSON/SSE
 ```
 
 ## Quick start
 
 ```sh
 go build -o wrapi ./cmd/wrapi
-./wrapi                          # listens on 127.0.0.1:8787
+./wrapi serve                # default window mode: workspace (invisible)
 ```
 
-On first start the Playwright driver is fetched automatically; the bundled
-Chromium is reused from `~/.cache/ms-playwright` if present.
+## Subcommands
 
-## API
+| Command            | Description |
+|--------------------|-------------|
+| `wrapi serve`      | start the HTTP server (default when run without args) |
+| `wrapi ask "…"`    | one-shot query, prints the answer (`-sources` adds URLs) |
+| `wrapi chat`       | interactive REPL over one conversation session (`-new` = fresh) |
+| `wrapi pipe`       | JSONL bridge: `{"prompt":…}` lines in, result objects out |
 
-| Endpoint              | Method | Body                                | Description |
-|-----------------------|--------|-------------------------------------|-------------|
-| `/health`             | GET    | —                                   | liveness |
-| `/v1/ask`             | POST   | `{"prompt": "…", "fresh": true, "timeout_s": 90}` | one AI Mode query (fresh search session by default) |
-| `/v1/followup`        | POST   | `{"prompt": "…"}`                   | follow-up through the on-page input, keeps conversation context (experimental) |
-| `/v1/reset`           | POST   | —                                   | close all pages, keep cookies/profile |
-| `/v1/screenshot`      | GET    | —                                   | PNG of the current page (debug) |
-| `/v1/page.html`       | GET    | —                                   | current DOM of the last page (debug, for selector tuning) |
+## HTTP API
 
-Example:
+### OpenAI-compatible
+
+| Endpoint                  | Description |
+|---------------------------|-------------|
+| `GET  /v1/models`         | model list (`wrapi-google-ai`) |
+| `POST /v1/chat/completions` | standard fields (`model`, `messages`, `stream`); WRAPI extras: `session` — conversation id. Without a session each request flattens the transcript into one fresh query; with a session the conversation lives on Google's side via follow-ups (auto-detected). |
+
+Streaming: OpenAI SSE chunks with content deltas, final chunk carries a
+`wrapi` field (sources, session, mode), then `data: [DONE]`.
 
 ```sh
-curl -s http://127.0.0.1:8787/v1/ask -d '{"prompt":"What is the capital of Poland?"}'
+curl -s http://127.0.0.1:8787/v1/chat/completions -d '{
+  "model": "wrapi-google-ai",
+  "messages": [{"role":"user","content":"What is the capital of Poland?"}]
+}'
 ```
 
-Response shape:
+### Native
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/ask`          | `{"prompt", "session", "stream", "timeout_s"}` — fresh query |
+| `POST /v1/followup`     | follow-up in the session's conversation |
+| `GET/POST/DELETE /v1/sessions` | list / create / delete conversation sessions |
+| `POST /v1/reset?session=ID` | clear a session page |
+| `GET  /v1/screenshot?session=ID`, `GET /v1/page.html?session=ID` | debug |
+
+Native streaming (`"stream": true`) emits NDJSON: `{"delta": "…"}` lines,
+terminated by one full result object.
+
+Answer shape (native):
 
 ```json
 {
-  "answer": "The capital of Poland is Warsaw (Polish: Warszawa). …",
+  "answer": "The capital of Poland is Warsaw …",
   "sources": [
-    { "site": "Wikipedia", "title": "Warsaw - Wikipedia", "snippet": "…", "url": "https://en.wikipedia.org/wiki/Warsaw" }
+    { "site": "Wikipedia", "title": "Warsaw - Wikipedia", "url": "https://en.wikipedia.org/wiki/Warsaw", "snippet": "…" }
   ],
   "url": "https://www.google.com/search?q=…&udm=50&csuir=1&hl=en",
   "mode": "fresh",
-  "elapsed_ms": 9421
+  "session": "default",
+  "elapsed_ms": 3400
 }
 ```
 
-Errors: `403` with `{"error": "… /sorry/ wall …"}` when Google bot-walls the
-request, `500` with details otherwise.
+Errors: `403` + `{"error": "… /sorry/ wall …"}` when Google bot-walls the
+request, `4xx/5xx` otherwise.
 
-## Configuration (env vars)
+## Window modes (Hyprland)
 
-| Var               | Default          | Meaning |
-|-------------------|------------------|---------|
-| `WRAPI_ADDR`      | `127.0.0.1:8787` | listen address |
-| `WRAPI_PROFILE_DIR` | `data/profile` | persistent Chromium profile (cookies survive restarts) |
-| `WRAPI_HEADLESS`  | `false`          | headless Chromium **gets bot-walled by Google** — leave off |
-| `WRAPI_HIDE_WINDOW` | `true`         | headed browser parked off-screen (`--window-position=-32000,-32000`) |
-| `WRAPI_HL`        | `en`             | `hl=` UI language parameter |
-| `WRAPI_TIMEOUT`   | `90s`            | default per-request timeout |
+The browser window is tagged with WM class `wrapi` and placed via
+`hyprctl eval` (Hyprland ≥ 0.57 Lua IPC). Without Hyprland the window simply
+opens normally.
 
-## Why headed mode
+| Mode (`-mode`) | Behaviour |
+|----------------|-----------|
+| `workspace` *(default)* | parked **silently** on workspace 8 (`-workspace N`) — never visible, your active workspace is not switched |
+| `mini` | floated as a tiny bar in the corner of the focused monitor (`-mini-width`/`-mini-height`, default 500×120). Chromium's own minimum width is ~500px, so 10×10 is not physically possible; height can be tiny |
+| `visible` | deterministic: moved (non-silently) to workspace 8 and focused |
+| `headless` | no window at all — **experimental, Google bot-walls headless** |
 
-Google serves the `/sorry/` bot wall to headless browsers. WRAPI runs a real
-headed Chromium with `--disable-blink-features=AutomationControlled` (so
-`navigator.webdriver` is not exposed) and parks the window off-screen, which
-keeps the browser fingerprint genuine while staying invisible. If you still
-get walled, run `WRAPI_HIDE_WINDOW=0 ./wrapi`, trigger one query and solve
-the captcha manually — the persistent profile keeps the clearance.
+Env equivalents: `WRAPI_MODE`, `WRAPI_WORKSPACE`, `WRAPI_MINI_WIDTH`,
+`WRAPI_MINI_HEIGHT`. Other settings: `WRAPI_ADDR`, `WRAPI_PROFILE_DIR`,
+`WRAPI_TIMEOUT`, `WRAPI_HL`.
 
-## Extraction notes
+## Anti-bot notes
 
-Selector ground truth (probed 2026-11-17, see `tools/probe*.mjs`):
+- Headed Chromium with `--disable-blink-features=AutomationControlled`
+  (no `navigator.webdriver`); the profile at `data/profile` keeps cookies
+  and clearance across restarts.
+- Google cookie-consent dialog ("Before you continue to Google") is
+  auto-dismissed on fresh profiles (prefers *Reject all*).
+- Headless gets walled; headed does not. The `/sorry/` wall can also hit
+  the IP after heavy use — it decays after a while.
+- If a wall/captcha needs manual solving: in `visible` mode the window is
+  on workspace 8, switch there and click through once — the profile keeps
+  the clearance.
 
-- AI answer pane: `div[data-subtree="aimc"]`
+## Extraction ground truth
+
+Probed against the live DOM (see `tools/probe*.mjs`):
+
+- AI panes: `div[data-subtree="aimc"]` — follow-ups spawn **new** panes;
+  the newest content is always in the last pane, last
+  `[data-scope-id="turn"]` (when markers exist; the engine falls back to
+  text-growth detection otherwise)
 - Answer body: `[data-container-id="main-col"]`
-- Completion signal: `[data-complete="true"]` (streaming marker)
-- Inline citations: `a.gQWhZ` (encrypted `/goto?url=…` links, resolved via
-  the browser's request context with redirect-following)
-- Source cards: `li.Ioqnib` (site name, title, snippet)
+- Inline citations: `a.gQWhZ`; source cards: `li.Ioqnib`
+- Encrypted `/goto?url=…` links are resolved to real URLs through the
+  browser's request context (redirect-following)
 
-If Google changes the DOM, check `/v1/page.html` after a failing ask and
-update the selectors in `internal/engine/engine.go`.
+If Google changes the DOM, dump the live page with `/v1/page.html` and
+adjust the selectors in `internal/engine/engine.go`.
 
 ## Layout
 
 ```
-cmd/wrapi/          entry point (env config, HTTP server wiring)
-internal/engine/    Playwright lifecycle, query + extraction logic
-internal/server/    JSON HTTP handlers
-tools/              DOM probe scripts (Node + Playwright, dev-only)
+cmd/wrapi/          entry point: serve / ask / chat / pipe
+internal/engine/    Playwright lifecycle, Hyprland placement, sessions, extraction
+internal/server/    native + OpenAI-compatible HTTP handlers
+tools/              DOM / Hyprland probe scripts (dev-only)
 data/profile/       browser profile (gitignored)
 ```
 
