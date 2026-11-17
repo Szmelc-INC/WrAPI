@@ -197,14 +197,25 @@ func (e *Engine) launch() error {
 // viewport emulation), so geometry is applied verify-and-retry style.
 // Failure is logged, not fatal: without hyprctl the window simply opens
 // where the compositor puts it.
-func (e *Engine) placeWindow() {
+// placeWindow moves the just-launched browser window via Hyprland IPC.
+// SAFETY: this never targets the user's active workspace — only the
+// dedicated workspace (silent or focused per mode) or floating geometry.
+// Chromium keeps resizing itself for a moment after startup (Playwright
+// viewport emulation), so geometry is applied verify-and-retry style.
+// Failure is logged, not fatal: without hyprctl the window simply opens
+// where the compositor puts it.
+func (e *Engine) placeWindow() bool {
 	addr, err := waitWindowByClass(WindowClass, 15*time.Second)
 	if err != nil {
 		log.Printf("window placement skipped: %v", err)
-		return
+		return false
 	}
 	switch e.cfg.WindowMode {
 	case ModeMini:
+		// Floating a window that sits on an inactive workspace silently
+		// no-ops in Hyprland, so mini geometry only sticks when the window
+		// is on the focused workspace (i.e. right at launch). When it does
+		// not settle, fall back to the hidden workspace mode.
 		x, y, ok := monitorCorner(e.cfg.MiniWidth, e.cfg.MiniHeight)
 		for attempt := 0; attempt < 5; attempt++ {
 			time.Sleep(700 * time.Millisecond)
@@ -216,28 +227,39 @@ func (e *Engine) placeWindow() {
 			if win, err := windowByAddress(addr); err == nil && win.Floating &&
 				near(win.Size[0], e.cfg.MiniWidth) && near(win.Size[1], e.cfg.MiniHeight) &&
 				(!ok || (near(win.At[0], x) && near(win.At[1], y))) {
-				return // settled
+				return true // settled
 			}
 		}
-		log.Printf("mini placement did not fully settle (chromium/compositor race)")
+		log.Printf("mini placement did not settle (floating requires the focused workspace); falling back to workspace mode")
+		e.cfg.WindowMode = ModeWorkspace
+		return e.moveToWorkspace(addr, true)
 	case ModeVisible:
 		// Focused (non-silent) move: the workspace is switched to, so the
 		// window is actually seen; deterministic, never under the cursor.
 		if err := hyprEval(fmt.Sprintf(`hl.dispatch(hl.dsp.window.move({address='%s', workspace=%d, silent=false}))`, addr, e.cfg.Workspace)); err != nil {
 			log.Printf("visible placement failed: %v", err)
+			return false
 		}
+		return true
 	default: // workspace
-		for attempt := 0; attempt < 4; attempt++ {
-			if err := hyprEval(fmt.Sprintf(`hl.dispatch(hl.dsp.window.move({address='%s', workspace=%d, silent=true}))`, addr, e.cfg.Workspace)); err != nil {
-				log.Printf("workspace placement failed: %v", err)
-				return
-			}
-			time.Sleep(500 * time.Millisecond)
-			if win, err := windowByAddress(addr); err == nil && win.Workspace.ID == e.cfg.Workspace {
-				return
-			}
+		return e.moveToWorkspace(addr, true)
+	}
+}
+
+// moveToWorkspace silently parks the window on the dedicated workspace,
+// verifying it actually landed there.
+func (e *Engine) moveToWorkspace(addr string, silent bool) bool {
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := hyprEval(fmt.Sprintf(`hl.dispatch(hl.dsp.window.move({address='%s', workspace=%d, silent=%v}))`, addr, e.cfg.Workspace, silent)); err != nil {
+			log.Printf("workspace placement failed: %v", err)
+			return false
+		}
+		time.Sleep(500 * time.Millisecond)
+		if win, err := windowByAddress(addr); err == nil && win.Workspace.ID == e.cfg.Workspace {
+			return true
 		}
 	}
+	return false
 }
 
 func near(a, b int) bool {

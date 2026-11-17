@@ -105,7 +105,7 @@ opens normally.
 | Mode (`-mode`) | Behaviour |
 |----------------|-----------|
 | `workspace` *(default)* | parked **silently** on workspace 8 (`-workspace N`) — never visible, your active workspace is not switched |
-| `mini` | floated as a tiny bar in the corner of the focused monitor (`-mini-width`/`-mini-height`, default 500×120). Chromium's own minimum width is ~500px, so 10×10 is not physically possible; height can be tiny |
+| `mini` | floated as a tiny bar in the corner of the focused monitor (`-mini-width`/`-mini-height`, default 500×120). Chromium's own minimum width is ~500px, so 10×10 is not physically possible; height can be tiny. **Only sticks when the browser launches while that workspace is focused** — Hyprland's float dispatch no-ops on inactive workspaces, so at runtime `wrapi window mini` safely falls back to workspace mode |
 | `visible` | deterministic: moved (non-silently) to workspace 8 and focused |
 | `headless` | no window at all — **experimental, Google bot-walls headless** |
 
