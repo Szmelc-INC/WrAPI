@@ -148,10 +148,11 @@ Bundled drivers:
 - **google-ai** *(default)* — Google AI Mode (`udm=50`): URL strategy,
   multi-pane/turn extraction, encrypted-source resolution, consent
   dismissal, `/sorry/` wall detection.
-- **meta-ai** — Meta AI in WhatsApp Web: `input` strategy, opens the Meta
-  AI chat, streams the last incoming bubble. Needs a one-time login:
-  `wrapi login meta-ai`, switch to workspace 8, scan the QR — the browser
-  profile keeps the session.
+- **meta-ai** — Meta AI in WhatsApp Web (verified end-to-end): `input`
+  strategy, opens the Meta AI chat, streams the last AI bubble (bubble
+  timestamps and system disclaimers stripped; user messages identified by
+  their status ticks). One-time login: `wrapi login meta-ai`, switch to
+  workspace 8, scan the QR — the browser profile keeps the session.
 
 Selecting a driver: `-driver my-ai` on `say/ask/chat/pipe/new`,
 `"driver"` field in native API requests, `"model": "wrapi/my-ai"` (or bare

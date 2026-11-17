@@ -363,15 +363,21 @@ func (s *Session) Ask(eng *Engine, prompt string, timeout time.Duration, onDelta
 			return nil, fmt.Errorf("goto: %w", err)
 		}
 		s.dismissConsent()
-		if err := s.waitVisible(spec.Start.WaitSelector, timeout); err != nil {
-			return nil, err
-		}
+		// On chat-style sites the composer only exists once the AI chat is
+		// open: click the opener first (waiting for it doubles as the
+		// "page loaded" gate), then wait for the composer.
 		if spec.Start.OpenSelector != "" {
+			if err := s.waitVisible(spec.Start.OpenSelector, timeout); err != nil {
+				return nil, err
+			}
 			if err := s.page.Locator(spec.Start.OpenSelector).First().Click(pw.LocatorClickOptions{
 				Timeout: pw.Float(15000),
 			}); err != nil {
 				log.Printf("%s: open selector click failed: %v", spec.ID, err)
 			}
+		}
+		if err := s.waitVisible(spec.Start.WaitSelector, timeout); err != nil {
+			return nil, err
 		}
 		baseline := s.paneText()
 		turnsBefore := s.countTurns()
