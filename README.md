@@ -96,6 +96,68 @@ Answer shape (native):
 Errors: `403` + `{"error": "… /sorry/ wall …"}` when Google bot-walls the
 request, `4xx/5xx` otherwise.
 
+## Drivers: adding any site/AI
+
+Every site the engine can talk to is a declarative JSON spec in `drivers/`.
+Adding a new AI is dropping in a new file — no recompilation, no code:
+
+```jsonc
+// drivers/my-ai.json — the required skeleton
+{
+  "id": "my-ai",                              // used as model/driver id
+  "label": "My AI",
+  "start": {
+    "strategy": "url",                        // url: prompt goes in the URL
+    "url": "https://example.com/chat?q={prompt}&lang={hl}",
+    "wait_selector": ".answer-pane"           // must appear before we read
+  },
+  "followup": {                               // the composer
+    "input_selector": "footer textarea",      // or div[contenteditable]
+    "input_mode": "fill",                     // or "type" for picky editors
+    "send_button": "footer [aria-label=Send]",// Enter fallback
+    "focus_click": true
+  },
+  "state_js":   "() => ({...})",              // {ready, text, complete} probe
+  "extract_js": "() => ({...})",              // {answer, sources[], turns}
+  "cleanup": { "strip_suffix_contains": "..." }
+}
+```
+
+How the pieces map to behaviour:
+
+| Field | What it does |
+|-------|--------------|
+| `start.strategy` | `url` = search-style site (prompt in URL); `input` = open page, click `open_selector`, type the prompt (chat sites like WhatsApp) |
+| `start.wait_selector` | gate before reading starts (also the post-login signal) |
+| `followup.*` | where and how to type + submit follow-ups (Enter, Send-button fallback) |
+| `state_js` | polled every 700 ms: `{ready, text, complete}` — `text` growth streams to clients |
+| `extract_js` | final parse: `{answer, sources: [{site,title,snippet,href}], turns}` |
+| `turn_count_js`, `pane_text_js` | submit-detection signals (turn growth / pane text change) |
+| `consent_js` | click-through for popups/cookie walls |
+| `blocked_on_url` | bot-wall marker → HTTP 403 with a clear error |
+| `cleanup` | strip prompt echo / disclaimers from the answer |
+| `resolve_goto_links` | decrypt `/goto?url=`-style redirects (Google) |
+| `login_url`, `login_hint` | `wrapi login <id>` opens the page and prints the hint |
+
+Tuning workflow: run a query, dump the live DOM with
+`GET /v1/page.html?session=…`, adjust selectors in the JSON, restart the
+service — done.
+
+Bundled drivers:
+
+- **google-ai** *(default)* — Google AI Mode (`udm=50`): URL strategy,
+  multi-pane/turn extraction, encrypted-source resolution, consent
+  dismissal, `/sorry/` wall detection.
+- **meta-ai** — Meta AI in WhatsApp Web: `input` strategy, opens the Meta
+  AI chat, streams the last incoming bubble. Needs a one-time login:
+  `wrapi login meta-ai`, switch to workspace 8, scan the QR — the browser
+  profile keeps the session.
+
+Selecting a driver: `-driver my-ai` on `say/ask/chat/pipe/new`,
+`"driver"` field in native API requests, `"model": "wrapi/my-ai"` (or bare
+`"my-ai"`) in `/v1/chat/completions`, `WRAPI_DRIVER` env for the default.
+`wrapi drivers` lists what is installed.
+
 ## Window modes (Hyprland)
 
 The browser window is tagged with WM class `wrapi` and placed via

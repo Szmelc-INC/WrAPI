@@ -1,11 +1,12 @@
-// Package engine drives a real Chromium via Playwright against Google AI
-// Mode (https://www.google.com/search?q=PROMPT&udm=50&csuir=1) and extracts
-// the AI answer together with its sources.
+// Package engine drives a real Chromium via Playwright against AI chats on
+// real web pages. Everything site-specific lives in declarative driver
+// specs (see internal/driver and drivers/*.json): where to type, how to
+// submit, how to read the streaming answer and where sources live. The
+// engine itself is one generic state machine.
 //
 // Window placement goes through Hyprland IPC (hyprctl eval, Lua API): the
-// browser is tagged with WM class "wrapi" and then either parked silently on
-// a dedicated workspace (default), floated as a tiny corner bar, or shown
-// normally. Headless exists but Google bot-walls it.
+// browser is tagged with WM class "wrapi" and parked silently on a
+// dedicated workspace by default — it never appears on the user's desktop.
 package engine
 
 import (
@@ -24,74 +25,27 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"wrapi/internal/driver"
+
 	pw "github.com/mxschmitt/playwright-go"
 )
 
-// ErrBlocked is returned when Google serves its automation /sorry/ wall.
-var ErrBlocked = errors.New("google blocked the request (/sorry/ wall) - try clearing the profile or solving the captcha once in headed mode")
+// ErrBlocked is returned when the site serves its bot wall (e.g. Google's
+// /sorry/ page).
+var ErrBlocked = errors.New("the site blocked the request (bot wall) - wait for the rate limit to decay or solve the challenge once in visible mode")
 
 // Window modes.
 const (
 	ModeWorkspace = "workspace" // silent park on a dedicated workspace (default)
 	ModeMini      = "mini"      // floated tiny bar in the corner of the focused monitor
-	ModeVisible   = "visible"   // normal window on the dedicated workspace (focused)
-	ModeHeadless  = "headless"  // no window at all (experimental: Google walls this)
+	ModeVisible   = "visible"   // focused on the dedicated workspace
+	ModeHeadless  = "headless"  // no window at all (experimental: gets bot-walled)
 )
 
 // WindowClass tags the browser window for hyprctl targeting.
 const WindowClass = "wrapi"
 
-const (
-	aiModeSelector = `div[data-subtree="aimc"]`
-	// Candidate probe: main-col of the last turn of the LAST aimc pane
-	// (follow-ups append turns and spawn new panes — freshest content is
-	// always last).
-	candidateJS = `() => {
-		const p = document.querySelectorAll('div[data-subtree="aimc"]');
-		const aimc = p.length ? p[p.length-1] : null;
-		if (!aimc) return { ready: false };
-		const turns = aimc.querySelectorAll('[data-scope-id="turn"]');
-		const scope = turns.length ? turns[turns.length - 1] : aimc;
-		const main = scope.querySelector('[data-container-id="main-col"]') || scope;
-		return { ready: true, text: main.innerText, complete: !!scope.querySelector('[data-complete="true"]') };
-	}`
-	turnCountJS = `() => document.querySelectorAll('div[data-subtree="aimc"] [data-scope-id="turn"]').length`
-	aimcTextJS  = `() => { const p = document.querySelectorAll('div[data-subtree="aimc"]'); const a = p.length ? p[p.length-1] : null; return a ? a.innerText : ''; }`
-	// Final extraction: answer text plus every source entry on the page.
-	extractJS = `() => {
-		const p = document.querySelectorAll('div[data-subtree="aimc"]');
-		const aimc = p.length ? p[p.length-1] : null;
-		if (!aimc) return null;
-		const turns = aimc.querySelectorAll('[data-scope-id="turn"]');
-		const scope = turns.length ? turns[turns.length - 1] : aimc;
-		const main = scope.querySelector('[data-container-id="main-col"]') || scope;
-		const out = { answer: main.innerText, sources: [], turns: turns.length };
-		const seen = new Set();
-		const lines = t => (t || '').split('\n').map(s => s.trim()).filter(Boolean);
-		const add = (a, site, title, snippet) => {
-			const href = a.getAttribute('href') || '';
-			if (!href) return;
-			if (seen.has(href)) return;
-			seen.add(href);
-			out.sources.push({ site: (site || '').trim(), title: (title || '').trim(), snippet: (snippet || '').trim(), href });
-		};
-		scope.querySelectorAll('li.Ioqnib').forEach(li => {
-			const a = li.querySelector('a[href^="/goto"]');
-			if (!a) return;
-			const l = lines(li.innerText);
-			add(a, l[0] || '', l[1] || '', l.slice(2).join(' '));
-		});
-		scope.querySelectorAll('a.gQWhZ').forEach(a => {
-			const l = lines(a.innerText);
-			add(a, l[0] || '', l[1] || '', l.slice(2).join(' '));
-		});
-		return out;
-	}`
-	// The follow-up composer, scoped to the AI Mode input plate.
-	inputSel = `[data-xid="aim-mars-input-plate"] textarea, textarea[aria-label="Ask anything"]`
-)
-
-// Source is a single citation from the AI answer.
+// Source is a single citation from an answer.
 type Source struct {
 	Site    string `json:"site,omitempty"`
 	Title   string `json:"title,omitempty"`
@@ -99,7 +53,7 @@ type Source struct {
 	Snippet string `json:"snippet,omitempty"`
 }
 
-// Answer is the result of one AI Mode query.
+// Answer is the result of one query.
 type Answer struct {
 	Answer  string   `json:"answer"`
 	Sources []Source `json:"sources"`
@@ -109,28 +63,35 @@ type Answer struct {
 
 // Config controls the engine. Values come from env vars / CLI flags.
 type Config struct {
-	Addr       string
-	ProfileDir string
-	WindowMode string // workspace | mini | visible | headless
-	Workspace  int    // dedicated workspace number for workspace/visible modes
-	MiniWidth  int
-	MiniHeight int
-	HL         string // hl= URL parameter (UI language)
-	Timeout    time.Duration
+	Addr          string
+	ProfileDir    string
+	DriversDir    string
+	DefaultDriver string
+	WindowMode    string // workspace | mini | visible | headless
+	Workspace     int    // dedicated workspace number
+	MiniWidth     int
+	MiniHeight    int
+	HL            string // hl= URL parameter (UI language)
+	Timeout       time.Duration
 }
 
-// Engine owns the browser process and the session table.
+// Engine owns the browser process, the driver registry and the session
+// table.
 type Engine struct {
 	cfg      Config
+	drivers  *driver.Registry
 	mu       sync.Mutex // guards sessions and browser lifecycle
 	pw       *pw.Playwright
 	ctx      pw.BrowserContext
 	sessions map[string]*Session
 }
 
-// Session is one conversation: a dedicated browser page plus its state.
+// Session is one conversation: a dedicated browser page, its driver spec
+// and its state.
 type Session struct {
 	ID      string
+	Driver  string
+	spec    *driver.Spec
 	page    pw.Page
 	mu      sync.Mutex // serializes asks on this session
 	URL     string
@@ -141,19 +102,26 @@ type Session struct {
 // Start launches the persistent browser context, places its window
 // according to cfg.WindowMode and creates the default session.
 func Start(cfg Config) (*Engine, error) {
+	registry, err := driver.Load(cfg.DriversDir, cfg.DefaultDriver)
+	if err != nil {
+		return nil, err
+	}
 	if err := pw.Install(); err != nil {
 		return nil, fmt.Errorf("playwright driver install: %w", err)
 	}
-	e := &Engine{cfg: cfg, sessions: map[string]*Session{}}
+	e := &Engine{cfg: cfg, drivers: registry, sessions: map[string]*Session{}}
 	if err := e.launch(); err != nil {
 		return nil, err
 	}
-	if _, err := e.NewSession("default"); err != nil {
+	if _, err := e.NewSession("default", cfg.DefaultDriver); err != nil {
 		_ = e.Close()
 		return nil, err
 	}
 	return e, nil
 }
+
+// Drivers exposes the driver registry (for /v1/models etc.).
+func (e *Engine) Drivers() *driver.Registry { return e.drivers }
 
 func (e *Engine) launch() error {
 	var err error
@@ -171,7 +139,7 @@ func (e *Engine) launch() error {
 	args := []string{
 		"--no-first-run",
 		"--no-default-browser-check",
-		// Google serves the /sorry/ wall when navigator.webdriver is exposed.
+		// Sites serve bot walls when navigator.webdriver is exposed.
 		"--disable-blink-features=AutomationControlled",
 		"--class=" + WindowClass,
 	}
@@ -193,15 +161,8 @@ func (e *Engine) launch() error {
 }
 
 // placeWindow moves the just-launched browser window via Hyprland IPC.
-// Chromium keeps resizing itself for a moment after startup (Playwright
-// viewport emulation), so geometry is applied verify-and-retry style.
-// Failure is logged, not fatal: without hyprctl the window simply opens
-// where the compositor puts it.
-// placeWindow moves the just-launched browser window via Hyprland IPC.
 // SAFETY: this never targets the user's active workspace — only the
 // dedicated workspace (silent or focused per mode) or floating geometry.
-// Chromium keeps resizing itself for a moment after startup (Playwright
-// viewport emulation), so geometry is applied verify-and-retry style.
 // Failure is logged, not fatal: without hyprctl the window simply opens
 // where the compositor puts it.
 func (e *Engine) placeWindow() bool {
@@ -262,29 +223,26 @@ func (e *Engine) moveToWorkspace(addr string, silent bool) bool {
 	return false
 }
 
-func near(a, b int) bool {
-	d := a - b
-	if d < 0 {
-		d = -d
-	}
-	return d <= 4
-}
-
-// NewSession creates a session with the given id (random when empty).
-func (e *Engine) NewSession(id string) (*Session, error) {
+// NewSession creates a session with the given id (random when empty) bound
+// to the named driver (default when empty).
+func (e *Engine) NewSession(id, driverID string) (*Session, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	spec, err := e.drivers.Get(driverID)
+	if err != nil {
+		return nil, err
+	}
 	if id == "" {
 		id = randID()
 	}
-	if _, exists := e.sessions[id]; exists {
-		return e.sessions[id], nil
+	if s, exists := e.sessions[id]; exists {
+		return s, nil
 	}
 	page, err := e.ctx.NewPage()
 	if err != nil {
 		return nil, fmt.Errorf("opening page: %w", err)
 	}
-	s := &Session{ID: id, page: page, Created: time.Now()}
+	s := &Session{ID: id, Driver: spec.ID, spec: spec, page: page, Created: time.Now()}
 	e.sessions[id] = s
 	return s, nil
 }
@@ -298,11 +256,12 @@ func (e *Engine) Session(id string) (*Session, error) {
 		return s, nil
 	}
 	if id == "default" {
+		spec := e.drivers.Default()
 		page, err := e.ctx.NewPage()
 		if err != nil {
 			return nil, err
 		}
-		s := &Session{ID: id, page: page, Created: time.Now()}
+		s := &Session{ID: id, Driver: spec.ID, spec: spec, page: page, Created: time.Now()}
 		e.sessions[id] = s
 		return s, nil
 	}
@@ -316,7 +275,7 @@ func (e *Engine) Sessions() []map[string]any {
 	out := make([]map[string]any, 0, len(e.sessions))
 	for _, s := range e.sessions {
 		out = append(out, map[string]any{
-			"id": s.ID, "turns": s.Turns, "url": s.URL,
+			"id": s.ID, "driver": s.Driver, "turns": s.Turns, "url": s.URL,
 			"created": s.Created.UTC().Format(time.RFC3339),
 		})
 	}
@@ -341,6 +300,36 @@ func (e *Engine) DeleteSession(id string) error {
 	return s.page.Close()
 }
 
+// OpenLogin navigates a dedicated page to the driver's login URL so a
+// human can log in once (QR scan, credentials); the persistent profile
+// keeps the session afterwards. Returns the human-facing hint.
+func (e *Engine) OpenLogin(driverID string) (string, error) {
+	spec, err := e.drivers.Get(driverID)
+	if err != nil {
+		return "", err
+	}
+	if spec.LoginURL == "" {
+		return "", fmt.Errorf("driver %q has no login_url", spec.ID)
+	}
+	s, err := e.NewSession("login-"+spec.ID, spec.ID)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.page.Goto(spec.LoginURL, pw.PageGotoOptions{
+		WaitUntil: pw.WaitUntilStateDomcontentloaded,
+		Timeout:   pw.Float(60000),
+	}); err != nil {
+		return "", fmt.Errorf("opening login page: %w", err)
+	}
+	hint := spec.LoginHint
+	if hint == "" {
+		hint = "Log in in the browser window (workspace " + fmt.Sprintf("%d", e.cfg.Workspace) + "); the profile keeps the session."
+	}
+	return hint, nil
+}
+
 // Close shuts the browser and the playwright driver down.
 func (e *Engine) Close() error {
 	e.mu.Lock()
@@ -354,84 +343,95 @@ func (e *Engine) Close() error {
 	return nil
 }
 
-func (e *Engine) searchURL(prompt string) string {
-	return "https://www.google.com/search?q=" + url.QueryEscape(prompt) +
-		"&udm=50&csuir=1&hl=" + url.QueryEscape(e.cfg.HL)
-}
-
-// Ask runs a fresh AI Mode query in the session's page (a new q= URL resets
-// the conversation). onDelta, when non-nil, receives streaming text chunks.
+// Ask runs a fresh query in the session's page following the driver spec:
+// the "url" strategy encodes the prompt in the start URL (search-style
+// sites), the "input" strategy opens the page, clicks the open button and
+// types into the composer. onDelta, when non-nil, receives streaming text
+// chunks.
 func (s *Session) Ask(eng *Engine, prompt string, timeout time.Duration, onDelta func(string)) (*Answer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, err := s.page.Goto(eng.searchURL(prompt), pw.PageGotoOptions{
-		WaitUntil: pw.WaitUntilStateDomcontentloaded,
-		Timeout:   pw.Float(float64(timeout.Milliseconds())),
-	}); err != nil {
-		return nil, fmt.Errorf("goto: %w", err)
+	spec := s.spec
+	ms := float64(timeout.Milliseconds())
+
+	switch spec.Start.Strategy {
+	case "input":
+		if _, err := s.page.Goto(spec.Start.URL, pw.PageGotoOptions{
+			WaitUntil: pw.WaitUntilStateDomcontentloaded, Timeout: pw.Float(ms),
+		}); err != nil {
+			return nil, fmt.Errorf("goto: %w", err)
+		}
+		s.dismissConsent()
+		if err := s.waitVisible(spec.Start.WaitSelector, timeout); err != nil {
+			return nil, err
+		}
+		if spec.Start.OpenSelector != "" {
+			if err := s.page.Locator(spec.Start.OpenSelector).First().Click(pw.LocatorClickOptions{
+				Timeout: pw.Float(15000),
+			}); err != nil {
+				log.Printf("%s: open selector click failed: %v", spec.ID, err)
+			}
+		}
+		baseline := s.paneText()
+		turnsBefore := s.countTurns()
+		if err := s.typePrompt(prompt); err != nil {
+			return nil, err
+		}
+		if err := s.submit(); err != nil {
+			return nil, err
+		}
+		if !s.waitSubmitted(turnsBefore, baseline, prompt, timeout/3) {
+			return nil, fmt.Errorf("prompt was not submitted (no new answer appeared; is the site logged in? try `wrapi login %s`)", spec.ID)
+		}
+	default: // url
+		target := strings.ReplaceAll(spec.Start.URL, "{prompt}", url.QueryEscape(prompt))
+		target = strings.ReplaceAll(target, "{hl}", url.QueryEscape(eng.cfg.HL))
+		if _, err := s.page.Goto(target, pw.PageGotoOptions{
+			WaitUntil: pw.WaitUntilStateDomcontentloaded, Timeout: pw.Float(ms),
+		}); err != nil {
+			return nil, fmt.Errorf("goto: %w", err)
+		}
+		if spec.BlockedOnURL != "" && strings.Contains(s.page.URL(), spec.BlockedOnURL) {
+			return nil, ErrBlocked
+		}
+		s.dismissConsent()
+		if err := s.waitVisible(spec.Start.WaitSelector, timeout); err != nil {
+			if spec.BlockedOnURL != "" && strings.Contains(s.page.URL(), spec.BlockedOnURL) {
+				return nil, ErrBlocked
+			}
+			return nil, err
+		}
 	}
-	if strings.Contains(s.page.URL(), "/sorry/") {
-		return nil, ErrBlocked
-	}
-	eng.dismissConsent(s.page)
-	if _, err := s.page.WaitForSelector(aiModeSelector, pw.PageWaitForSelectorOptions{
-		Timeout: pw.Float(float64(timeout.Milliseconds())),
-		State:   pw.WaitForSelectorStateVisible,
-	}); err != nil {
-		return nil, fmt.Errorf("ai mode pane did not appear (page: %s): %w", s.page.URL(), err)
-	}
-	if err := s.streamAnswer(s.page, timeout, "", onDelta); err != nil {
+
+	if err := s.streamAnswer(timeout, "", onDelta); err != nil {
 		return nil, err
 	}
 	return s.finish(eng, "fresh", prompt, "")
 }
 
-// FollowUp sends a follow-up question through the on-page composer of the
-// session's page, keeping the conversation context. onDelta streams chunks.
+// FollowUp sends a follow-up through the on-page composer, keeping the
+// conversation context. onDelta streams chunks.
 func (s *Session) FollowUp(eng *Engine, prompt string, timeout time.Duration, onDelta func(string)) (*Answer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, err := s.page.WaitForSelector(inputSel, pw.PageWaitForSelectorOptions{
-		Timeout: pw.Float(10000),
-		State:   pw.WaitForSelectorStateVisible,
-	}); err != nil {
-		return nil, fmt.Errorf("follow-up input not found (run a fresh ask first): %w", err)
+	spec := s.spec
+	if err := s.waitVisible(spec.Followup.InputSelector, 10*time.Second); err != nil {
+		return nil, fmt.Errorf("composer not found (run a fresh ask first, or log in: `wrapi login %s`): %w", spec.ID, err)
 	}
-	// The composer only accepts input when focused and needs a beat after
-	// fill before Enter registers (mirrors manual interaction).
-	comp := s.page.Locator(inputSel).First()
-	if err := comp.Click(); err != nil {
+	baseline := s.paneText()
+	turnsBefore := s.countTurns()
+	if err := s.typePrompt(prompt); err != nil {
 		return nil, err
 	}
-	if err := comp.Fill(prompt); err != nil {
+	if err := s.submit(); err != nil {
 		return nil, err
 	}
-	time.Sleep(400 * time.Millisecond)
-	turnsBefore := countTurns(s.page)
-	baseline := aimcText(s.page)
-	if err := comp.Press("Enter"); err != nil {
-		return nil, err
+	if !s.waitSubmitted(turnsBefore, baseline, prompt, timeout/3) {
+		return nil, fmt.Errorf("follow-up was not submitted (no new answer appeared)")
 	}
-	// Enter sometimes does not submit (focus, composer state). Fall back to
-	// the Send button. Turn markers may be absent and the question bubble
-	// lives outside the aimc subtree, so aimc text change is the reliable
-	// signal that submission happened.
-	if !waitSubmitted(s.page, turnsBefore, 6*time.Second, prompt, baseline) {
-		send := s.page.Locator(`[data-xid="input-plate-send-button"]`).First()
-		if btn, err := send.ElementHandle(); err == nil && btn != nil {
-			if v, err := btn.Evaluate("el => !el.disabled"); err == nil {
-				if enabled, ok := v.(bool); ok && enabled {
-					_ = send.Click()
-				}
-			}
-		}
-		if !waitSubmitted(s.page, turnsBefore, 8*time.Second, prompt, baseline) {
-			return nil, fmt.Errorf("follow-up was not submitted (no new answer appeared)")
-		}
-	}
-	if err := s.streamAnswer(s.page, timeout, baseline, onDelta); err != nil {
+	if err := s.streamAnswer(timeout, baseline, onDelta); err != nil {
 		return nil, err
 	}
 	return s.finish(eng, "followup", prompt, baseline)
@@ -462,22 +462,143 @@ func (s *Session) PageHTML() (string, error) {
 	return s.page.Content()
 }
 
+// --- generic driver-spec mechanics ---
+
+// waitVisible waits for a selector to become visible.
+func (s *Session) waitVisible(selector string, timeout time.Duration) error {
+	_, err := s.page.WaitForSelector(selector, pw.PageWaitForSelectorOptions{
+		Timeout: pw.Float(float64(timeout.Milliseconds())),
+		State:   pw.WaitForSelectorStateVisible,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: element %q did not appear (page: %s): %w", s.spec.ID, selector, s.page.URL(), err)
+	}
+	return nil
+}
+
+// typePrompt puts text into the composer per the spec's input mode.
+func (s *Session) typePrompt(prompt string) error {
+	spec := s.spec
+	comp := s.page.Locator(spec.Followup.InputSelector).First()
+	if spec.Followup.FocusClick {
+		if err := comp.Click(pw.LocatorClickOptions{Timeout: pw.Float(10000)}); err != nil {
+			return err
+		}
+	}
+	switch spec.Followup.InputMode {
+	case "type":
+		if err := s.page.Keyboard().Type(prompt, pw.KeyboardTypeOptions{Delay: pw.Float(8)}); err != nil {
+			return err
+		}
+	default:
+		if err := comp.Fill(prompt); err != nil {
+			return err
+		}
+	}
+	time.Sleep(400 * time.Millisecond)
+	return nil
+}
+
+// submit sends the typed prompt: Enter first, Send button fallback.
+func (s *Session) submit() error {
+	if err := s.page.Keyboard().Press("Enter"); err != nil {
+		return err
+	}
+	spec := s.spec
+	if spec.Followup.SendButton == "" {
+		return nil
+	}
+	time.Sleep(600 * time.Millisecond)
+	send := s.page.Locator(spec.Followup.SendButton).First()
+	if btn, err := send.ElementHandle(); err == nil && btn != nil {
+		if v, err := btn.Evaluate("el => !el.disabled && el.offsetParent !== null"); err == nil {
+			if enabled, ok := v.(bool); ok && enabled {
+				return send.Click(pw.LocatorClickOptions{Timeout: pw.Float(5000)})
+			}
+		}
+	}
+	return nil
+}
+
+// waitSubmitted polls until the conversation shows a new answer (turn
+// count growth, prompt echo in the pane, or pane text change).
+func (s *Session) waitSubmitted(before int, baseline, prompt string, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		if s.countTurns() > before {
+			return true
+		}
+		cur := s.paneText()
+		if cur != baseline && len(cur) > s.spec.StreamMinText {
+			return true
+		}
+		if prompt != "" && strings.Contains(cur, prompt) {
+			return true
+		}
+	}
+	return false
+}
+
+// state runs the spec's state probe.
+func (s *Session) state() map[string]interface{} {
+	raw, err := s.page.Evaluate(s.spec.StateJS)
+	if err != nil {
+		return nil
+	}
+	m, _ := raw.(map[string]interface{})
+	return m
+}
+
+func (s *Session) countTurns() int {
+	if s.spec.TurnCountJS == "" {
+		return 0
+	}
+	v, err := s.page.Evaluate(s.spec.TurnCountJS)
+	if err != nil {
+		return 0
+	}
+	return int(toFloat(v))
+}
+
+func (s *Session) paneText() string {
+	if s.spec.PaneTextJS == "" {
+		return ""
+	}
+	v, err := s.page.Evaluate(s.spec.PaneTextJS)
+	if err != nil {
+		return ""
+	}
+	return toString(v)
+}
+
+// dismissConsent best-effort clicks through popups/consent dialogs that
+// cover the page (spec-provided JS).
+func (s *Session) dismissConsent() {
+	if s.spec.ConsentJS == "" {
+		return
+	}
+	v, err := s.page.Evaluate(s.spec.ConsentJS)
+	if err != nil || v == nil {
+		return
+	}
+	log.Printf("%s: dismissed dialog (%v)", s.spec.ID, v)
+	_ = s.page.WaitForLoadState(pw.PageWaitForLoadStateOptions{State: pw.LoadStateNetworkidle})
+	time.Sleep(1200 * time.Millisecond)
+}
+
 // streamAnswer polls the candidate answer until it stops growing (and the
-// turn is marked complete when Google sets that attribute), invoking
-// onDelta with each text growth. baseline is the pre-submit aimc text for
-// follow-ups: streaming only starts once the candidate diverges from it.
-func (s *Session) streamAnswer(page pw.Page, timeout time.Duration, baseline string, onDelta func(string)) error {
+// driver's complete flag is set when provided), invoking onDelta with each
+// text growth. baseline is the pre-submit pane text: streaming only starts
+// once the candidate diverges from it.
+func (s *Session) streamAnswer(timeout time.Duration, baseline string, onDelta func(string)) error {
 	deadline := time.Now().Add(timeout)
 	started := baseline == ""
 	emitted := ""
 	stable, lastLen := 0, -1
 	for time.Now().Before(deadline) {
 		time.Sleep(700 * time.Millisecond)
-		raw, err := page.Evaluate(candidateJS)
-		if err != nil {
-			return fmt.Errorf("candidate probe: %w", err)
-		}
-		m, _ := raw.(map[string]interface{})
+		m := s.state()
 		if m == nil || m["ready"] != true {
 			continue
 		}
@@ -502,8 +623,8 @@ func (s *Session) streamAnswer(page pw.Page, timeout time.Duration, baseline str
 		}
 		lastLen = length
 		complete, _ := m["complete"].(bool)
-		// Two consecutive polls with no growth: done. When Google marks
-		// the turn complete a single stable poll is enough.
+		// Two consecutive polls with no growth: done. When the driver
+		// reports completeness a single stable poll is enough.
 		if (complete && stable >= 1) || stable >= 2 {
 			return nil
 		}
@@ -516,7 +637,7 @@ func (s *Session) streamAnswer(page pw.Page, timeout time.Duration, baseline str
 
 // finish runs the final extraction and normalizes the answer.
 func (s *Session) finish(eng *Engine, mode, prompt, baseline string) (*Answer, error) {
-	raw, err := s.page.Evaluate(extractJS)
+	raw, err := s.page.Evaluate(s.spec.ExtractJS)
 	if err != nil {
 		return nil, fmt.Errorf("extract: %w", err)
 	}
@@ -528,26 +649,40 @@ func (s *Session) finish(eng *Engine, mode, prompt, baseline string) (*Answer, e
 	}
 	answer := strings.TrimSpace(toString(m["answer"]))
 	turns := int(toFloat(m["turns"]))
-	s.Turns += 1
+	s.Turns++
 	if mode == "followup" && turns == 0 {
 		// DOM without turn markers: the whole conversation is in the answer
 		// text — keep only what is new: content after the echo of the
 		// current prompt, or after the longest common prefix with the
 		// pre-submit baseline.
-		echo := "AI Mode reply for " + prompt
-		if i := strings.LastIndex(answer, echo); i >= 0 {
-			answer = answer[i+len(echo):]
+		echo := strings.ReplaceAll(s.spec.Cleanup.StripPrefix, "{prompt}", prompt)
+		if echo != "" {
+			if i := strings.LastIndex(answer, echo); i >= 0 {
+				answer = answer[i+len(echo):]
+			} else if baseline != "" {
+				n := commonPrefixLen(baseline, answer)
+				for n < len(answer) && !utf8.RuneStart(answer[n]) {
+					n++
+				}
+				answer = answer[n:]
+			}
 		} else if baseline != "" {
 			n := commonPrefixLen(baseline, answer)
-			// Avoid cutting mid-rune when old text re-rendered differently.
 			for n < len(answer) && !utf8.RuneStart(answer[n]) {
 				n++
 			}
 			answer = answer[n:]
 		}
 	}
-	answer = stripPromptEcho(answer, prompt)
-	answer = stripDisclaimer(answer)
+	if p := strings.ReplaceAll(s.spec.Cleanup.StripPrefix, "{prompt}", prompt); p != "" && strings.HasPrefix(answer, p) {
+		answer = strings.TrimLeft(strings.TrimPrefix(answer, p), " \n")
+	}
+	if m := s.spec.Cleanup.StripSuffixContains; m != "" {
+		if i := strings.LastIndex(answer, m); i >= 0 {
+			answer = answer[:i]
+		}
+	}
+	answer = strings.TrimSpace(answer)
 
 	var sources []Source
 	if list, ok := m["sources"].([]interface{}); ok {
@@ -562,7 +697,7 @@ func (s *Session) finish(eng *Engine, mode, prompt, baseline string) (*Answer, e
 				Snippet: toString(src["snippet"]),
 			}
 			href := toString(src["href"])
-			if strings.HasPrefix(href, "/goto") {
+			if s.spec.ResolveGoto && strings.HasPrefix(href, "/goto") {
 				out.URL = eng.resolveGoto(href)
 			} else {
 				out.URL = href
@@ -579,33 +714,9 @@ func (s *Session) finish(eng *Engine, mode, prompt, baseline string) (*Answer, e
 	return &Answer{Answer: answer, Sources: sources, URL: s.URL, Mode: mode}, nil
 }
 
-// dismissConsent best-effort dismisses the Google cookie-consent dialog
-// ("Before you continue to Google") that covers fresh profiles and blocks
-// clicks. Rejecting is preferred over accepting.
-func (e *Engine) dismissConsent(page pw.Page) {
-	const clickJS = `() => {
-		const names = ['reject all', 'alle ablehnen', 'odrzuć wszystko', 'odrzucam wszystko',
-			'accept all', 'alle akzeptieren', 'zaakceptuj wszystko', 'akceptuję wszystko'];
-		const btns = [...document.querySelectorAll('button')];
-		for (const name of names) {
-			const b = btns.find(x => (x.innerText || '').trim().toLowerCase() === name);
-			if (b) { b.click(); return name; }
-		}
-		return null;
-	}`
-	v, err := page.Evaluate(clickJS)
-	if err != nil || v == nil {
-		return
-	}
-	log.Printf("dismissed Google consent dialog (%v)", v)
-	// The button submits a form: give the navigation a moment to settle.
-	_ = page.WaitForLoadState(pw.PageWaitForLoadStateOptions{State: pw.LoadStateNetworkidle})
-	time.Sleep(1500 * time.Millisecond)
-}
-
-// resolveGoto follows Google's encrypted redirect link and returns the real
-// target URL. The request context shares browser cookies and follows
-// redirects; failures fall back to the raw /goto link.
+// resolveGoto follows an encrypted redirect link (Google's /goto?url=)
+// and returns the real target URL. The request context shares browser
+// cookies and follows redirects; failures fall back to the raw link.
 func (e *Engine) resolveGoto(href string) string {
 	full := "https://www.google.com" + href
 	resp, err := e.ctx.Request().Get(full, pw.APIRequestContextGetOptions{MaxRedirects: pw.Int(10)})
@@ -614,39 +725,6 @@ func (e *Engine) resolveGoto(href string) string {
 		return full
 	}
 	return resp.URL()
-}
-
-// waitSubmitted polls until the conversation shows a new answer (turn
-// markers, prompt echo, or aimc text change) or the deadline passes.
-func waitSubmitted(page pw.Page, before int, wait time.Duration, prompt, baseline string) bool {
-	deadline := time.Now().Add(wait)
-	for time.Now().Before(deadline) {
-		time.Sleep(500 * time.Millisecond)
-		if countTurns(page) > before {
-			return true
-		}
-		cur := aimcText(page)
-		if (cur != baseline && len(cur) > 50) || (prompt != "" && strings.Contains(cur, prompt)) {
-			return true
-		}
-	}
-	return false
-}
-
-func countTurns(page pw.Page) int {
-	v, err := page.Evaluate(turnCountJS)
-	if err != nil {
-		return 0
-	}
-	return int(toFloat(v))
-}
-
-func aimcText(page pw.Page) string {
-	v, err := page.Evaluate(aimcTextJS)
-	if err != nil {
-		return ""
-	}
-	return toString(v)
 }
 
 // --- Hyprland IPC helpers ---
@@ -685,7 +763,7 @@ func hyprRun(args ...string) ([]byte, error) {
 }
 
 // discoverHyprSig finds a live Hyprland instance by probing every
-// signature directory under the user runtime dir. Most recent first.
+// signature directory under the user runtime dir, newest first.
 func discoverHyprSig() string {
 	uid := os.Getuid()
 	base := os.Getenv("XDG_RUNTIME_DIR")
@@ -696,7 +774,6 @@ func discoverHyprSig() string {
 	if err != nil {
 		return ""
 	}
-	// ReadDir is sorted by name; probe all and keep the newest by mtime.
 	var best string
 	var bestMt int64 = -1
 	for _, e := range entries {
@@ -734,6 +811,26 @@ func hyprEval(lua string) error {
 	return nil
 }
 
+// waitWindowByClass polls hyprctl until a window with the given class
+// appears (the browser takes a moment to map its first window).
+func waitWindowByClass(class string, wait time.Duration) (string, error) {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if out, err := hyprRun("-j", "clients"); err == nil {
+			var wins []hyprWindow
+			if json.Unmarshal(out, &wins) == nil {
+				for _, w := range wins {
+					if w.Class == class {
+						return w.Address, nil
+					}
+				}
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return "", fmt.Errorf("no hyprctl window with class %q (is this Hyprland?)", class)
+}
+
 // hyprWindow is the subset of `hyprctl -j clients` entries we need.
 type hyprWindow struct {
 	Address   string `json:"address"`
@@ -764,27 +861,6 @@ func windowByAddress(addr string) (hyprWindow, error) {
 		}
 	}
 	return hyprWindow{}, fmt.Errorf("window %s not found", addr)
-}
-
-// waitWindowByClass polls hyprctl until a window with the given class
-// appears (the browser takes a moment to map its first window).
-func waitWindowByClass(class string, wait time.Duration) (string, error) {
-	deadline := time.Now().Add(wait)
-	for time.Now().Before(deadline) {
-		out, err := hyprRun("-j", "clients")
-		if err == nil {
-			var wins []hyprWindow
-			if json.Unmarshal(out, &wins) == nil {
-				for _, w := range wins {
-					if w.Class == class {
-						return w.Address, nil
-					}
-				}
-			}
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	return "", fmt.Errorf("no hyprctl window with class %q (is this Hyprland?)", class)
 }
 
 // hyprMonitor is the subset of `hyprctl -j monitors` entries we need.
@@ -850,6 +926,14 @@ func (e *Engine) WindowState() (map[string]any, error) {
 
 // --- small helpers ---
 
+func near(a, b int) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= 4
+}
+
 func randID() string {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
@@ -877,23 +961,6 @@ func commonPrefixLen(a, b string) int {
 		}
 	}
 	return n
-}
-
-func stripPromptEcho(answer, prompt string) string {
-	echo := "AI Mode reply for " + prompt
-	if strings.HasPrefix(answer, echo) {
-		answer = strings.TrimPrefix(answer, echo)
-		answer = strings.TrimLeft(answer, " \n")
-	}
-	return answer
-}
-
-func stripDisclaimer(answer string) string {
-	const marker = "AI responses may include mistakes"
-	if i := strings.LastIndex(answer, marker); i >= 0 {
-		answer = answer[:i]
-	}
-	return strings.TrimSpace(answer)
 }
 
 func toString(v interface{}) string {

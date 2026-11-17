@@ -16,7 +16,7 @@ import (
 )
 
 // ModelID is what we advertise to OpenAI-compatible clients.
-const ModelID = "wrapi-google-ai"
+const ModelID = "wrapi"
 
 // Server wires engine calls to HTTP handlers.
 type Server struct {
@@ -42,6 +42,7 @@ func New(e *engine.Engine, defTimeout time.Duration) *Server {
 	s.mux.HandleFunc("POST /v1/reset", s.handleReset)
 	s.mux.HandleFunc("GET /v1/window", s.handleWindowGet)
 	s.mux.HandleFunc("POST /v1/window", s.handleWindowPlace)
+	s.mux.HandleFunc("POST /v1/login", s.handleLogin)
 	s.mux.HandleFunc("DELETE /v1/sessions", s.handleSessionDelete)
 	s.mux.HandleFunc("GET /v1/screenshot", s.handleScreenshot)
 	s.mux.HandleFunc("GET /v1/page.html", s.handlePageHTML)
@@ -67,13 +68,16 @@ type chatRequest struct {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]any{
-		"object": "list",
-		"data": []map[string]any{{
-			"id": ModelID, "object": "model",
+	drivers := s.eng.Drivers().List()
+	data := make([]map[string]any, 0, len(drivers))
+	for _, d := range drivers {
+		data = append(data, map[string]any{
+			"id": d["id"], "object": "model",
 			"created": 1730000000, "owned_by": "wrapi",
-		}},
-	})
+			"wrapi": d,
+		})
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -99,15 +103,21 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	timeout := s.defTimeout
 
-	// Session selection: an explicit session keeps Google-side context via
+	// Session selection: an explicit session keeps site-side context via
 	// follow-ups; without one the transcript is flattened into a fresh ask.
+	// The model field doubles as the driver selector ("wrapi/<driver-id>",
+	// "wrapi", or a bare driver id).
+	driverID := req.Model
+	if i := strings.Index(driverID, "/"); i >= 0 {
+		driverID = driverID[i+1:]
+	}
 	sessID := req.Session
 	if sessID == "" {
 		sessID = "openai-" + fmt.Sprintf("%d", time.Now().UnixNano()%1e6)
 	}
 	sess, err := s.eng.Session(sessID)
 	if err != nil {
-		sess, err = s.eng.NewSession(sessID)
+		sess, err = s.eng.NewSession(sessID, driverID)
 		if err != nil {
 			respondErr(w, err)
 			return
@@ -138,7 +148,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]any{
-		"id": id, "object": "chat.completion", "created": created, "model": ModelID,
+		"id": id, "object": "chat.completion", "created": created, "model": "wrapi/" + sess.Driver,
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       map[string]any{"role": "assistant", "content": a.Answer},
@@ -164,7 +174,7 @@ func (s *Server) streamChat(w http.ResponseWriter, sess *engine.Session, eng *en
 	}
 	chunk := func(delta map[string]any, finish any) map[string]any {
 		return map[string]any{
-			"id": id, "object": "chat.completion.chunk", "created": created, "model": ModelID,
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": "wrapi/" + sess.Driver,
 			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}},
 		}
 	}
@@ -188,7 +198,7 @@ func (s *Server) streamChat(w http.ResponseWriter, sess *engine.Session, eng *en
 	// Final chunk carries stop plus WRAPI extras (sources etc.) as a
 	// non-standard field that OpenAI clients simply ignore.
 	send(map[string]any{
-		"id": id, "object": "chat.completion.chunk", "created": created, "model": ModelID,
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": "wrapi/" + sess.Driver,
 		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
 		"wrapi":   map[string]any{"sources": final.Sources, "url": final.URL, "session": sess.ID, "mode": final.Mode},
 	})
@@ -230,6 +240,7 @@ type askRequest struct {
 	Fresh    *bool  `json:"fresh,omitempty"`
 	Stream   bool   `json:"stream,omitempty"`
 	Session  string `json:"session,omitempty"`
+	Driver   string `json:"driver,omitempty"`
 	TimeoutS int    `json:"timeout_s,omitempty"`
 }
 
@@ -239,7 +250,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	sess, err := s.sessionFor(req.Session)
+	sess, err := s.sessionFor(req.Session, req.Driver)
 	if err != nil {
 		respondErr(w, err)
 		return
@@ -271,7 +282,7 @@ func (s *Server) handleSay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	sess, err := s.sessionFor(req.Session)
+	sess, err := s.sessionFor(req.Session, req.Driver)
 	if err != nil {
 		respondErr(w, err)
 		return
@@ -305,7 +316,7 @@ func (s *Server) handleFollowUp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	sess, err := s.sessionFor(req.Session)
+	sess, err := s.sessionFor(req.Session, req.Driver)
 	if err != nil {
 		respondErr(w, err)
 		return
@@ -364,15 +375,32 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID string `json:"id"`
+		ID     string `json:"id"`
+		Driver string `json:"driver"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	sess, err := s.eng.NewSession(req.ID)
+	sess, err := s.eng.NewSession(req.ID, req.Driver)
 	if err != nil {
 		respondErr(w, err)
 		return
 	}
-	respondJSON(w, http.StatusOK, map[string]any{"session": sess.ID})
+	respondJSON(w, http.StatusOK, map[string]any{"session": sess.ID, "driver": sess.Driver})
+}
+
+// handleLogin opens the driver's login page in the shared browser so a
+// human can authenticate once (QR scan etc.); the persistent profile keeps
+// the session.
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Driver string `json:"driver"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	hint, err := s.eng.OpenLogin(req.Driver)
+	if err != nil {
+		respondErr(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"status": "login page opened", "hint": hint})
 }
 
 func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
@@ -414,7 +442,7 @@ func (s *Server) handleWindowPlace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.sessionFor(r.URL.Query().Get("session"))
+	sess, err := s.sessionFor(r.URL.Query().Get("session"), r.URL.Query().Get("driver"))
 	if err != nil {
 		respondErr(w, err)
 		return
@@ -430,12 +458,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
 		"engine": "google-ai-mode-udm50",
-		"model":  ModelID,
+		"model":  "wrapi (" + s.eng.Drivers().Default().ID + " default)",
 	})
 }
 
 func (s *Server) handleScreenshot(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.sessionFor(r.URL.Query().Get("session"))
+	sess, err := s.sessionFor(r.URL.Query().Get("session"), r.URL.Query().Get("driver"))
 	if err != nil {
 		respondErr(w, err)
 		return
@@ -450,7 +478,7 @@ func (s *Server) handleScreenshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePageHTML(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.sessionFor(r.URL.Query().Get("session"))
+	sess, err := s.sessionFor(r.URL.Query().Get("session"), r.URL.Query().Get("driver"))
 	if err != nil {
 		respondErr(w, err)
 		return
@@ -477,15 +505,15 @@ func decodeAsk(r *http.Request, req *askRequest) error {
 }
 
 // sessionFor resolves or creates the requested session ("default" when
-// empty).
-func (s *Server) sessionFor(id string) (*engine.Session, error) {
+// empty), binding it to the requested driver.
+func (s *Server) sessionFor(id, driverID string) (*engine.Session, error) {
 	if id == "" {
 		id = "default"
 	}
 	if sess, err := s.eng.Session(id); err == nil {
 		return sess, nil
 	}
-	return s.eng.NewSession(id)
+	return s.eng.NewSession(id, driverID)
 }
 
 func (s *Server) timeout(reqS int) time.Duration {

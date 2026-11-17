@@ -88,6 +88,10 @@ func main() {
 		rmCmd(os.Args[2:])
 	case "window":
 		windowCmd(os.Args[2:])
+	case "drivers":
+		driversCmd(os.Args[2:])
+	case "login":
+		loginCmd(os.Args[2:])
 	case "status":
 		statusCmd(os.Args[2:])
 	case "logs":
@@ -127,6 +131,11 @@ window control:
   window         show where the browser window lives now
   window MODE    re-place it: workspace | mini | visible
 
+drivers:
+  drivers        list installed site drivers (default marked)
+  login DRIVER   open the driver's login page (e.g. meta-ai QR scan)
+  (-driver ID on say/ask/chat/pipe/new selects the site)
+
 serve flags:
   -mode workspace|mini|visible|headless   browser window mode (default workspace)
   -workspace N     workspace number for workspace/visible modes (default 8)
@@ -155,6 +164,8 @@ func serveCmd(args []string) {
 	miniH := fs.Int("mini-height", envInt("WRAPI_MINI_HEIGHT", 120), "mini window height")
 	hl := fs.String("hl", envStr("WRAPI_HL", "en"), "Google UI language")
 	timeout := fs.Duration("timeout", envDur("WRAPI_TIMEOUT", 90*time.Second), "default request timeout")
+	driversDir := fs.String("drivers", envStr("WRAPI_DRIVERS_DIR", "drivers"), "driver specs directory")
+	defaultDriver := fs.String("driver", envStr("WRAPI_DRIVER", ""), "default driver id (first alphabetically when empty)")
 	_ = fs.Parse(args)
 
 	switch *mode {
@@ -166,6 +177,7 @@ func serveCmd(args []string) {
 	cfg := engine.Config{
 		Addr: *addr, ProfileDir: *profile, WindowMode: *mode, Workspace: *workspace,
 		MiniWidth: *miniW, MiniHeight: *miniH, HL: *hl, Timeout: *timeout,
+		DriversDir: *driversDir, DefaultDriver: *defaultDriver,
 	}
 	fmt.Fprintf(os.Stderr, "wrapi: serving on %s (window=%s, profile=%s)\n", cfg.Addr, cfg.WindowMode, cfg.ProfileDir)
 	if cfg.WindowMode == engine.ModeHeadless {
@@ -207,11 +219,12 @@ func envDur(key string, def time.Duration) time.Duration {
 
 // --- shared client helpers ---
 
-// clientFlags registers the shared -addr and -session flags on fs.
-func clientFlags(fs *flag.FlagSet, defSession string) (addr, session *string) {
+// clientFlags registers the shared -addr, -session and -driver flags on fs.
+func clientFlags(fs *flag.FlagSet, defSession string) (addr, session, drv *string) {
 	addr = fs.String("addr", envStr("WRAPI_ADDR", "127.0.0.1:8787"), "server address")
 	session = fs.String("session", defSession, "session id")
-	return addr, session
+	drv = fs.String("driver", envStr("WRAPI_DRIVER", ""), "driver id (site) to use")
+	return addr, session, drv
 }
 
 // apiPost POSTs JSON and returns the decoded response.
@@ -279,7 +292,7 @@ func askCmd(args []string) {
 	sayMode = len(os.Args) > 1 && os.Args[1] == "say"
 
 	fs := flag.NewFlagSet("say", flag.ExitOnError)
-	addr, session := clientFlags(fs, "")
+	addr, session, driverID := clientFlags(fs, "")
 	fs.BoolVar(&sources, "sources", false, "print sources too")
 	fs.Parse(args)
 	prompt := strings.Join(fs.Args(), " ")
@@ -301,7 +314,7 @@ func askCmd(args []string) {
 		path = "/v1/say"
 	}
 	var out apiAnswer
-	if err := apiPost(*addr, path, map[string]any{"prompt": prompt, "session": sess}, &out); err != nil {
+	if err := apiPost(*addr, path, map[string]any{"prompt": prompt, "session": sess, "driver": *driverID}, &out); err != nil {
 		fmt.Fprintf(os.Stderr, "wrapi: %v\n", err)
 		os.Exit(1)
 	}
@@ -320,7 +333,7 @@ func askCmd(args []string) {
 
 func newCmd(args []string) {
 	fs := flag.NewFlagSet("new", flag.ExitOnError)
-	addr, _ := clientFlags(fs, "")
+	addr, _, driverID := clientFlags(fs, "")
 	fs.Parse(args)
 	sess, err := timeBasedSession()
 	if err != nil {
@@ -330,7 +343,7 @@ func newCmd(args []string) {
 	var out struct {
 		Session string `json:"session"`
 	}
-	if err := apiPost(*addr, "/v1/sessions", map[string]any{"id": sess}, &out); err != nil {
+	if err := apiPost(*addr, "/v1/sessions", map[string]any{"id": sess, "driver": *driverID}, &out); err != nil {
 		fmt.Fprintf(os.Stderr, "new: %v\n", err)
 		os.Exit(1)
 	}
@@ -344,7 +357,7 @@ func timeBasedSession() (string, error) {
 
 func clearCmd(args []string) {
 	fs := flag.NewFlagSet("clear", flag.ExitOnError)
-	addr, session := clientFlags(fs, "")
+	addr, session, _ := clientFlags(fs, "")
 	fs.Parse(args)
 	sess := *session
 	if sess == "" {
@@ -359,7 +372,7 @@ func clearCmd(args []string) {
 
 func sessionsCmd(args []string) {
 	fs := flag.NewFlagSet("sessions", flag.ExitOnError)
-	addr, _ := clientFlags(fs, "")
+	addr, _, _ := clientFlags(fs, "")
 	fs.Parse(args)
 	var out struct {
 		Sessions []struct {
@@ -385,7 +398,7 @@ func sessionsCmd(args []string) {
 
 func rmCmd(args []string) {
 	fs := flag.NewFlagSet("rm", flag.ExitOnError)
-	addr, _ := clientFlags(fs, "")
+	addr, _, _ := clientFlags(fs, "")
 	fs.Parse(args)
 	id := fs.Arg(0)
 	if id == "" {
@@ -399,11 +412,62 @@ func rmCmd(args []string) {
 	fmt.Fprintf(os.Stderr, "deleted session %s\n", id)
 }
 
+// --- drivers / login ---
+
+func driversCmd(args []string) {
+	fs := flag.NewFlagSet("drivers", flag.ExitOnError)
+	addr, _, _ := clientFlags(fs, "")
+	fs.Parse(args)
+	var out struct {
+		Data []struct {
+			ID    string         `json:"id"`
+			Wrapi map[string]any `json:"wrapi"`
+		} `json:"data"`
+	}
+	if err := apiGet(*addr, "/v1/models", &out); err != nil {
+		fmt.Fprintf(os.Stderr, "drivers: %v\n", err)
+		os.Exit(1)
+	}
+	for _, m := range out.Data {
+		def, _ := m.Wrapi["default"].(bool)
+		label, _ := m.Wrapi["label"].(string)
+		mark := " "
+		if def {
+			mark = "*"
+		}
+		fmt.Printf("%s %-14s %s\n", mark, m.ID, label)
+	}
+}
+
+func loginCmd(args []string) {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	addr, _, driverID := clientFlags(fs, "")
+	fs.Parse(args)
+	drv := fs.Arg(0)
+	if drv == "" {
+		drv = *driverID
+	}
+	if drv == "" {
+		fmt.Fprintln(os.Stderr, "usage: wrapi login DRIVER   (see wrapi drivers)")
+		os.Exit(2)
+	}
+	var out struct {
+		Status string `json:"status"`
+		Hint   string `json:"hint"`
+	}
+	if err := apiPost(*addr, "/v1/login", map[string]any{"driver": drv}, &out); err != nil {
+		fmt.Fprintf(os.Stderr, "login: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(out.Status)
+	fmt.Println(out.Hint)
+}
+
 // --- window / status / logs ---
 
 func windowCmd(args []string) {
 	fs := flag.NewFlagSet("window", flag.ExitOnError)
-	addr, _ := clientFlags(fs, "")
+	addr, _, _ := clientFlags(fs, "")
 	fs.Parse(args)
 	mode := fs.Arg(0)
 	var out map[string]any
@@ -445,7 +509,7 @@ func printWindowState(out map[string]any) {
 
 func statusCmd(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	addr, _ := clientFlags(fs, "")
+	addr, _, _ := clientFlags(fs, "")
 	fs.Parse(args)
 
 	unit, err := execSilent("systemctl", "--user", "is-active", "wrapi.service")
@@ -557,7 +621,7 @@ func execSilent(name string, arg ...string) (string, error) {
 
 func chatCmd(args []string) {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
-	addr, session := clientFlags(fs, "wrapi-repl")
+	addr, session, driverID := clientFlags(fs, "wrapi-repl")
 	newSess := fs.Bool("new", false, "start a fresh session")
 	fs.Parse(args)
 	if *newSess {
@@ -583,7 +647,7 @@ func chatCmd(args []string) {
 			first = false
 		}
 		var out apiAnswer
-		if err := apiPost(*addr, path, map[string]any{"prompt": prompt, "session": *session}, &out); err != nil {
+		if err := apiPost(*addr, path, map[string]any{"prompt": prompt, "session": *session, "driver": *driverID}, &out); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
 		}
@@ -596,7 +660,7 @@ func chatCmd(args []string) {
 
 func pipeCmd(args []string) {
 	fs := flag.NewFlagSet("pipe", flag.ExitOnError)
-	addr, _ := clientFlags(fs, "")
+	addr, _, driverID := clientFlags(fs, "")
 	fs.Parse(args)
 
 	enc := json.NewEncoder(os.Stdout)
@@ -610,6 +674,7 @@ func pipeCmd(args []string) {
 		var req struct {
 			Prompt   string `json:"prompt"`
 			Session  string `json:"session"`
+			Driver   string `json:"driver"`
 			Fresh    *bool  `json:"fresh"`
 			Followup bool   `json:"followup"`
 		}
@@ -626,8 +691,12 @@ func pipeCmd(args []string) {
 			path = "/v1/followup"
 		}
 		var out apiAnswer
+		drv := req.Driver
+		if drv == "" {
+			drv = *driverID
+		}
 		if err := apiPost(*addr, path, map[string]any{
-			"prompt": req.Prompt, "session": req.Session,
+			"prompt": req.Prompt, "session": req.Session, "driver": drv,
 		}, &out); err != nil {
 			_ = enc.Encode(map[string]any{"error": err.Error()})
 			continue

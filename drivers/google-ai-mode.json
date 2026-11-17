@@ -1,0 +1,26 @@
+{
+  "id": "google-ai",
+  "label": "Google AI Mode",
+  "start": {
+    "strategy": "url",
+    "url": "https://www.google.com/search?q={prompt}&udm=50&csuir=1&hl={hl}",
+    "wait_selector": "div[data-subtree=\"aimc\"]"
+  },
+  "followup": {
+    "input_selector": "[data-xid=\"aim-mars-input-plate\"] textarea, textarea[aria-label=\"Ask anything\"]",
+    "input_mode": "fill",
+    "send_button": "[data-xid=\"input-plate-send-button\"]",
+    "focus_click": true
+  },
+  "blocked_on_url": "/sorry/",
+  "consent_js": "() => { const names = ['reject all', 'alle ablehnen', 'odrzuć wszystko', 'odrzucam wszystko', 'accept all', 'alle akzeptieren', 'zaakceptuj wszystko', 'akceptuję wszystko']; const btns = [...document.querySelectorAll('button')]; for (const name of names) { const b = btns.find(x => (x.innerText || '').trim().toLowerCase() === name); if (b) { b.click(); return name; } } return null; }",
+  "state_js": "() => { const p = document.querySelectorAll('div[data-subtree=\"aimc\"]'); const aimc = p.length ? p[p.length-1] : null; if (!aimc) return { ready: false }; const turns = aimc.querySelectorAll('[data-scope-id=\"turn\"]'); const scope = turns.length ? turns[turns.length - 1] : aimc; const main = scope.querySelector('[data-container-id=\"main-col\"]') || scope; return { ready: true, text: main.innerText, complete: !!scope.querySelector('[data-complete=\"true\"]') }; }",
+  "turn_count_js": "() => document.querySelectorAll('div[data-subtree=\"aimc\"] [data-scope-id=\"turn\"]').length",
+  "pane_text_js": "() => { const p = document.querySelectorAll('div[data-subtree=\"aimc\"]'); const a = p.length ? p[p.length-1] : null; return a ? a.innerText : ''; }",
+  "extract_js": "() => { const p = document.querySelectorAll('div[data-subtree=\"aimc\"]'); const aimc = p.length ? p[p.length-1] : null; if (!aimc) return null; const turns = aimc.querySelectorAll('[data-scope-id=\"turn\"]'); const scope = turns.length ? turns[turns.length - 1] : aimc; const main = scope.querySelector('[data-container-id=\"main-col\"]') || scope; const out = { answer: main.innerText, sources: [], turns: turns.length }; const seen = new Set(); const lines = t => (t || '').split('\\n').map(s => s.trim()).filter(Boolean); const add = (a, site, title, snippet) => { const href = a.getAttribute('href') || ''; if (!href) return; if (seen.has(href)) return; seen.add(href); out.sources.push({ site: (site || '').trim(), title: (title || '').trim(), snippet: (snippet || '').trim(), href }); }; scope.querySelectorAll('li.Ioqnib').forEach(li => { const a = li.querySelector('a[href^=\"/goto\"]'); if (!a) return; const l = lines(li.innerText); add(a, l[0] || '', l[1] || '', l.slice(2).join(' ')); }); scope.querySelectorAll('a.gQWhZ').forEach(a => { const l = lines(a.innerText); add(a, l[0] || '', l[1] || '', l.slice(2).join(' ')); }); return out; }",
+  "cleanup": {
+    "strip_prefix": "AI Mode reply for {prompt}",
+    "strip_suffix_contains": "AI responses may include mistakes"
+  },
+  "resolve_goto_links": true
+}

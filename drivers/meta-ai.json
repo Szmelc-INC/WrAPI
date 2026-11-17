@@ -1,0 +1,26 @@
+{
+  "id": "meta-ai",
+  "label": "Meta AI (WhatsApp Web)",
+  "login_url": "https://web.whatsapp.com/",
+  "login_hint": "Switch to the browser workspace (default 8) and scan the QR code with your phone (WhatsApp → Settings → Linked devices). The profile keeps the session; you only do this once.",
+  "start": {
+    "strategy": "input",
+    "url": "https://web.whatsapp.com/",
+    "open_selector": "[aria-label=\"Meta AI\" i], [data-icon=\"ai-heart-blue\"], div[aria-label=\"Meta AI chat\" i]",
+    "wait_selector": "footer div[contenteditable=\"true\"]"
+  },
+  "followup": {
+    "input_selector": "footer div[contenteditable=\"true\"]",
+    "input_mode": "type",
+    "send_button": "footer button[aria-label=\"Send\" i], footer [data-icon=\"send\"]",
+    "focus_click": true
+  },
+  "consent_js": "() => { const names = ['got it', 'ok, got it', 'accept', 'continue', 'update', 'later', 'not now', 'zrozumiano', 'zaakceptuj', 'kontynuuj', 'później', 'nie teraz']; const btns = [...document.querySelectorAll('button, div[role=\"button\"]')]; for (const name of names) { const b = btns.find(x => (x.innerText || x.getAttribute('aria-label') || '').trim().toLowerCase() === name); if (b) { b.click(); return name; } } return null; }",
+  "state_js": "() => { const msgs = document.querySelectorAll('div[data-id]'); if (!msgs.length) return { ready: false }; let last = null; for (const m of msgs) { if (m.querySelector('.message-out')) continue; if (m.innerText && m.innerText.trim()) last = m; } if (!last) return { ready: false }; const t = last.innerText.trim(); const done = !!last.querySelector('[data-status=\"read\"], [data-icon=\"check-check\"], [data-icon=\"double-check\"], span[data-icon=\"tick\"]'); return { ready: true, text: t, complete: done || t.length > 0 }; }",
+  "turn_count_js": "() => document.querySelectorAll('div[data-id] .message-out').length",
+  "pane_text_js": "() => { const el = document.querySelector('div[data-id=\"\"] + div, footer'); const main = document.querySelector('#main'); return main ? main.innerText : ''; }",
+  "extract_js": "() => { const msgs = document.querySelectorAll('div[data-id]'); const out = { answer: '', sources: [], turns: 0 }; if (!msgs.length) return out; let last = null; for (const m of msgs) { if (m.querySelector('.message-out')) { out.turns++; continue; } if (m.innerText && m.innerText.trim()) last = m; } if (!last) return out; out.answer = last.innerText.trim(); last.querySelectorAll('a[href^=\"http\"]').forEach(a => { const href = a.getAttribute('href'); if (href && !out.sources.some(s => s.href === href)) out.sources.push({ site: '', title: a.innerText.trim(), snippet: '', href }); }); return out; }",
+  "cleanup": {
+    "strip_suffix_contains": "Meta AI can make mistakes"
+  }
+}
