@@ -35,10 +35,13 @@ func New(e *engine.Engine, defTimeout time.Duration) *Server {
 	s.mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	// Native surface.
 	s.mux.HandleFunc("POST /v1/ask", s.handleAsk)
+	s.mux.HandleFunc("POST /v1/say", s.handleSay)
 	s.mux.HandleFunc("POST /v1/followup", s.handleFollowUp)
 	s.mux.HandleFunc("GET /v1/sessions", s.handleSessions)
 	s.mux.HandleFunc("POST /v1/sessions", s.handleSessionCreate)
 	s.mux.HandleFunc("POST /v1/reset", s.handleReset)
+	s.mux.HandleFunc("GET /v1/window", s.handleWindowGet)
+	s.mux.HandleFunc("POST /v1/window", s.handleWindowPlace)
 	s.mux.HandleFunc("DELETE /v1/sessions", s.handleSessionDelete)
 	s.mux.HandleFunc("GET /v1/screenshot", s.handleScreenshot)
 	s.mux.HandleFunc("GET /v1/page.html", s.handlePageHTML)
@@ -259,6 +262,43 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSay routes smartly: a session with no turns gets a fresh ask, an
+// existing conversation gets a follow-up. This is what the `wrapi say`
+// CLI command uses, so terminal usage feels like one continuous chat.
+func (s *Server) handleSay(w http.ResponseWriter, r *http.Request) {
+	var req askRequest
+	if err := decodeAsk(r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sess, err := s.sessionFor(req.Session)
+	if err != nil {
+		respondErr(w, err)
+		return
+	}
+	timeout := s.timeout(req.TimeoutS)
+	start := time.Now()
+
+	if req.Stream {
+		s.streamNative(w, sess, sess.Turns == 0, req.Prompt, timeout, start)
+		return
+	}
+	var a *engine.Answer
+	if sess.Turns == 0 {
+		a, err = sess.Ask(s.eng, req.Prompt, timeout, nil)
+	} else {
+		a, err = sess.FollowUp(s.eng, req.Prompt, timeout, nil)
+	}
+	if err != nil {
+		respondErr(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"answer": a.Answer, "sources": a.Sources, "url": a.URL, "mode": a.Mode,
+		"session": sess.ID, "elapsed_ms": time.Since(start).Milliseconds(),
+	})
+}
+
 func (s *Server) handleFollowUp(w http.ResponseWriter, r *http.Request) {
 	var req askRequest
 	if err := decodeAsk(r, &req); err != nil {
@@ -346,6 +386,31 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]string{"deleted": id})
+}
+
+func (s *Server) handleWindowGet(w http.ResponseWriter, r *http.Request) {
+	state, err := s.eng.WindowState()
+	if err != nil {
+		respondErr(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleWindowPlace(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	state, err := s.eng.Place(req.Mode)
+	if err != nil {
+		respondErr(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {

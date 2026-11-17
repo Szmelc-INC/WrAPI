@@ -14,17 +14,35 @@ prompt → WRAPI (127.0.0.1:8787) → Playwright → google.com/search?q=…&udm
 
 ```sh
 go build -o wrapi ./cmd/wrapi
-./wrapi serve                # default window mode: workspace (invisible)
+cp wrapi ~/.local/bin/                 # one-time install
+systemctl --user enable --now wrapi.service   # or: wrapi serve
 ```
+
+The systemd user unit (`~/.config/systemd/user/wrapi.service`) starts the
+server on login, parks the browser silently on workspace 8 and restarts it
+on failure.
 
 ## Subcommands
 
 | Command            | Description |
 |--------------------|-------------|
-| `wrapi serve`      | start the HTTP server (default when run without args) |
-| `wrapi ask "…"`    | one-shot query, prints the answer (`-sources` adds URLs) |
+| `wrapi say "…"`    | ask in the **current session** (remembers it between calls, auto-continues the conversation) |
+| `wrapi ask "…"`    | one-shot query in a fresh session (`-sources` adds URLs) |
 | `wrapi chat`       | interactive REPL over one conversation session (`-new` = fresh) |
 | `wrapi pipe`       | JSONL bridge: `{"prompt":…}` lines in, result objects out |
+| `wrapi new`        | start a new session, make it current, print its id |
+| `wrapi clear`      | reset the current (or `-session`) conversation |
+| `wrapi sessions`   | list sessions (`*` marks the current one) |
+| `wrapi rm ID`      | delete a session |
+| `wrapi window`     | show where the browser window lives |
+| `wrapi window MODE`| re-place it: `workspace` \| `mini` \| `visible` |
+| `wrapi status`     | service + engine + window + sessions overview |
+| `wrapi logs [-n N]`| service journal |
+| `wrapi start/stop/restart/enable/disable/is-active` | systemd control |
+| `wrapi serve`      | run the HTTP server in the foreground (default without args) |
+
+`say` keeps its current session in `~/.local/state/wrapi/session`; pass
+`-session NAME` to target any session explicitly.
 
 ## HTTP API
 
@@ -50,9 +68,11 @@ curl -s http://127.0.0.1:8787/v1/chat/completions -d '{
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/ask`          | `{"prompt", "session", "stream", "timeout_s"}` — fresh query |
+| `POST /v1/say`          | smart routing: fresh query on an empty session, follow-up otherwise |
 | `POST /v1/followup`     | follow-up in the session's conversation |
 | `GET/POST/DELETE /v1/sessions` | list / create / delete conversation sessions |
 | `POST /v1/reset?session=ID` | clear a session page |
+| `GET  /v1/window`, `POST /v1/window` | inspect / re-place the browser window (`{"mode": "mini"}`) |
 | `GET  /v1/screenshot?session=ID`, `GET /v1/page.html?session=ID` | debug |
 
 Native streaming (`"stream": true`) emits NDJSON: `{"delta": "…"}` lines,

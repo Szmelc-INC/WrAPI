@@ -629,10 +629,80 @@ func aimcText(page pw.Page) string {
 
 // --- Hyprland IPC helpers ---
 
+// hyprSig caches the discovered Hyprland instance signature. Outside a
+// logged-in shell (systemd services) HYPRLAND_INSTANCE_SIGNATURE is not
+// set, so the live instance is found by probing /run/user/$UID/hypr/*.
+var hyprSig string
+
+// hyprRun runs hyprctl with the given args, injecting the discovered
+// instance signature when the environment does not provide one.
+func hyprRun(args ...string) ([]byte, error) {
+	run := func(sig string) ([]byte, error) {
+		a := args
+		if sig != "" {
+			a = append([]string{"-i", sig}, args...)
+		}
+		return exec.Command("hyprctl", a...).CombinedOutput()
+	}
+	if hyprSig == "" {
+		if v := os.Getenv("HYPRLAND_INSTANCE_SIGNATURE"); v != "" {
+			hyprSig = v
+		} else {
+			hyprSig = discoverHyprSig()
+		}
+	}
+	out, err := run(hyprSig)
+	if err != nil || strings.Contains(string(out), "Couldn't connect") {
+		// Hyprland may have restarted: re-discover and retry once.
+		if sig := discoverHyprSig(); sig != "" && sig != hyprSig {
+			hyprSig = sig
+			return run(hyprSig)
+		}
+	}
+	return out, err
+}
+
+// discoverHyprSig finds a live Hyprland instance by probing every
+// signature directory under the user runtime dir. Most recent first.
+func discoverHyprSig() string {
+	uid := os.Getuid()
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		base = fmt.Sprintf("/run/user/%d", uid)
+	}
+	entries, err := os.ReadDir(base + "/hypr")
+	if err != nil {
+		return ""
+	}
+	// ReadDir is sorted by name; probe all and keep the newest by mtime.
+	var best string
+	var bestMt int64 = -1
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		sig := e.Name()
+		if _, err := os.Stat(fmt.Sprintf("%s/hypr/%s/.socket.sock", base, sig)); err != nil {
+			continue
+		}
+		// Probe: only a live instance answers.
+		if out, err := exec.Command("hyprctl", "-i", sig, "-j", "activeworkspace").Output(); err == nil && len(out) > 0 {
+			if info.ModTime().Unix() > bestMt {
+				best, bestMt = sig, info.ModTime().Unix()
+			}
+		}
+	}
+	return best
+}
+
 // hyprEval runs a Lua snippet through `hyprctl eval` and reports whether
 // Hyprland accepted it (exit codes are useless; errors come as text).
 func hyprEval(lua string) error {
-	out, err := exec.Command("hyprctl", "eval", lua).CombinedOutput()
+	out, err := hyprRun("eval", lua)
 	if err != nil {
 		return fmt.Errorf("hyprctl eval: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -646,6 +716,7 @@ func hyprEval(lua string) error {
 type hyprWindow struct {
 	Address   string `json:"address"`
 	Class     string `json:"class"`
+	Title     string `json:"title"`
 	Floating  bool   `json:"floating"`
 	At        []int  `json:"at"`
 	Size      []int  `json:"size"`
@@ -657,7 +728,7 @@ type hyprWindow struct {
 // windowByAddress returns the current state of the window with the given
 // Hyprland address.
 func windowByAddress(addr string) (hyprWindow, error) {
-	out, err := exec.Command("hyprctl", "-j", "clients").Output()
+	out, err := hyprRun("-j", "clients")
 	if err != nil {
 		return hyprWindow{}, err
 	}
@@ -678,7 +749,7 @@ func windowByAddress(addr string) (hyprWindow, error) {
 func waitWindowByClass(class string, wait time.Duration) (string, error) {
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("hyprctl", "-j", "clients").Output()
+		out, err := hyprRun("-j", "clients")
 		if err == nil {
 			var wins []hyprWindow
 			if json.Unmarshal(out, &wins) == nil {
@@ -706,7 +777,7 @@ type hyprMonitor struct {
 // monitorCorner returns the bottom-right corner position for a w x h
 // floating window on the focused monitor.
 func monitorCorner(w, h int) (int, int, bool) {
-	out, err := exec.Command("hyprctl", "-j", "monitors").Output()
+	out, err := hyprRun("-j", "monitors")
 	if err != nil {
 		return 0, 0, false
 	}
@@ -721,6 +792,38 @@ func monitorCorner(w, h int) (int, int, bool) {
 		}
 	}
 	return mon.X + mon.Width - w - 10, mon.Y + mon.Height - h - 10, true
+}
+
+// Place re-places the browser window in the given mode at runtime
+// (POST /v1/window). Returns the resulting window state.
+func (e *Engine) Place(mode string) (map[string]any, error) {
+	switch mode {
+	case ModeWorkspace, ModeMini, ModeVisible:
+	default:
+		return nil, fmt.Errorf("invalid mode %q (want workspace|mini|visible)", mode)
+	}
+	e.cfg.WindowMode = mode
+	e.placeWindow()
+	return e.WindowState()
+}
+
+// WindowState reports where the browser window currently lives
+// (GET /v1/window). "present": false when Hyprland or the window is not
+// found — reported, not errored, so clients can treat it as state.
+func (e *Engine) WindowState() (map[string]any, error) {
+	addr, err := waitWindowByClass(WindowClass, 2*time.Second)
+	if err != nil {
+		return map[string]any{"present": false, "error": err.Error()}, nil
+	}
+	win, err := windowByAddress(addr)
+	if err != nil {
+		return map[string]any{"present": false, "error": err.Error()}, nil
+	}
+	return map[string]any{
+		"present": true, "address": win.Address, "workspace": win.Workspace.ID,
+		"floating": win.Floating, "at": win.At, "size": win.Size, "title": win.Title,
+		"mode": e.cfg.WindowMode,
+	}, nil
 }
 
 // --- small helpers ---
