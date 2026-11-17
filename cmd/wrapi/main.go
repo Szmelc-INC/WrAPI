@@ -621,39 +621,49 @@ func execSilent(name string, arg ...string) (string, error) {
 
 func chatCmd(args []string) {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
-	addr, session, driverID := clientFlags(fs, "wrapi-repl")
+	addr, session, driverID := clientFlags(fs, "")
 	newSess := fs.Bool("new", false, "start a fresh session")
+	noColor := fs.Bool("no-color", false, "disable colors and animation")
 	fs.Parse(args)
-	if *newSess {
-		*session = fmt.Sprintf("wrapi-%d", time.Now().Unix())
-	}
-	fmt.Fprintf(os.Stderr, "wrapi chat — session %s on %s (empty line or Ctrl-D exits)\n", *session, *addr)
 
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	first := true
-	for {
-		fmt.Fprint(os.Stderr, "> ")
-		if !sc.Scan() {
-			break
+	sess := *session
+	if sess == "" {
+		if *newSess {
+			sess = fmt.Sprintf("wrapi-%d", time.Now().Unix())
+		} else {
+			sess = loadCurrentSession()
 		}
-		prompt := strings.TrimSpace(sc.Text())
-		if prompt == "" {
-			break
-		}
-		path := "/v1/followup"
-		if first {
-			path = "/v1/ask"
-			first = false
-		}
-		var out apiAnswer
-		if err := apiPost(*addr, path, map[string]any{"prompt": prompt, "session": *session, "driver": *driverID}, &out); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			continue
-		}
-		fmt.Println(out.Answer)
-		fmt.Println()
 	}
+	drv := *driverID
+	if drv == "" {
+		// Resolve the session's (or the default) driver for the banner.
+		var sessList struct {
+			Sessions []struct {
+				ID     string `json:"id"`
+				Driver string `json:"driver"`
+			} `json:"sessions"`
+		}
+		if err := apiGet(*addr, "/v1/sessions", &sessList); err == nil {
+			for _, s := range sessList.Sessions {
+				if s.ID == sess {
+					drv = s.Driver
+					break
+				}
+			}
+		}
+	}
+	if drv == "" {
+		var models struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := apiGet(*addr, "/v1/models", &models); err == nil && len(models.Data) > 0 {
+			drv = models.Data[0].ID
+		}
+	}
+	saveCurrentSession(sess)
+	runChat(*addr, drv, sess, *noColor)
 }
 
 // --- pipe (JSONL bridge) --—

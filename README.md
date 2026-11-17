@@ -28,7 +28,7 @@ on failure.
 |--------------------|-------------|
 | `wrapi say "…"`    | ask in the **current session** (remembers it between calls, auto-continues the conversation) |
 | `wrapi ask "…"`    | one-shot query in a fresh session (`-sources` adds URLs) |
-| `wrapi chat`       | interactive REPL over one conversation session (`-new` = fresh) |
+| `wrapi chat`       | colorful interactive TUI over one conversation (`-driver X`, `-new`, `-no-color`) |
 | `wrapi pipe`       | JSONL bridge: `{"prompt":…}` lines in, result objects out |
 | `wrapi new`        | start a new session, make it current, print its id |
 | `wrapi clear`      | reset the current (or `-session`) conversation |
@@ -95,6 +95,34 @@ Answer shape (native):
 
 Errors: `403` + `{"error": "… /sorry/ wall …"}` when Google bot-walls the
 request, `4xx/5xx` otherwise.
+
+## The chat TUI
+
+`wrapi chat [-driver ID]` renders the conversation with a teal-on-dark
+palette (accent `#105c5c`), box-drawing chrome, a braille spinner with
+elapsed time while the AI thinks, markdown-lite answer formatting
+(headers, `**bold**`, bullets, code fences, quotes), a numbered sources
+block with underlined URLs and a per-turn meta line (session · mode ·
+time). In-REPL commands:
+
+```
+/new        start a fresh session        /clear    reset the conversation
+/driver ID  switch AI (new session)      /sources  toggle source display
+/session    show session info            /exit     quit
+```
+
+`NO_COLOR` or `-no-color` disables colors and animation.
+
+## Packaging
+
+- **Arch**: `makepkg -f` with the provided `PKGBUILD` (builds from the
+  GitHub repo, Go modules vendored in-tree; installs the binary, driver
+  JSONs to `/usr/share/wrapi/drivers` and a systemd user unit with
+  system paths; profile lands in `~/.local/share/wrapi/profile`).
+- **Nix**: `nix build` with the provided `flake.nix`
+  (`buildGoModule`, `vendorHash = null` thanks to the vendored modules;
+  `nix run` starts the server). Not build-verified on a nix machine yet —
+  if `go` version constraints complain, adjust the `nixpkgs` input pin.
 
 ## Drivers: adding any site/AI
 

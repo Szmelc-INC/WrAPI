@@ -1,0 +1,20 @@
+[Unit]
+Description=WRAPI - AI chat wrapper API (localhost)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/wrapi
+ExecStart=/usr/bin/wrapi serve
+Environment=WRAPI_MODE=workspace
+Environment=WRAPI_ADDR=127.0.0.1:8787
+Environment=WRAPI_DRIVERS_DIR=/usr/share/wrapi/drivers
+Environment=WRAPI_PROFILE_DIR=%h/.local/share/wrapi/profile
+Environment=HOME=%h
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target
